@@ -1,0 +1,22 @@
+# FloodPin Harvey — Python dependencies
+# pip install -r requirements.txt
+
+# Geospatial core
+rasterio>=1.3
+h3>=4.0
+shapely>=2.0
+numpy>=1.24
+scipy>=1.10
+
+# Data
+pandas>=2.0
+
+# AWS S3 (VIIRS download — public bucket, no credentials needed)
+boto3>=1.28
+botocore>=1.31
+
+# HTTP (DEM + Copernicus downloads)
+requests>=2.31
+
+# Optional: 10-50x speedup in downscaling inner loops
+# numba>=0.58
