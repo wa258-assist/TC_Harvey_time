@@ -1,0 +1,767 @@
+name: FloodPin — Harvey TC Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      dem_source:
+        description: "DEM source"
+        required: true
+        default: "usgs_3dep"
+        type: choice
+        options:
+          - usgs_3dep
+          - opentopo
+      flood_threshold:
+        description: "Min flood fraction to emit a pin (0.0–1.0)"
+        required: false
+        default: "0.01"
+        type: string
+      skip_download:
+        description: "Skip VIIRS download (reuse cached mosaics)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      skip_downscale:
+        description: "Skip downscaling (reuse cached depth rasters)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+env:
+  PYTHON_VERSION: "3.11"
+  EVENT_ID:       "H001"
+  OUT:            "./harvey_output"
+  # Cache keys — bump version suffix to invalidate
+  CACHE_DEM:      "dem-harvey-v1"
+  CACHE_VIIRS:    "viirs-harvey-20170825-20170901-v4"
+  CACHE_PW:       "perm-water-harvey-v2"
+  CACHE_DS:       "downscaled-harvey-v1"
+  CACHE_ZS:       "zonal-stats-harvey-v1"
+
+permissions:
+  issues: write
+  contents: write
+
+jobs:
+
+  # ── 1. Activate ──────────────────────────────────────────────────────────────
+  activate:
+    name: "1 — Activate"
+    runs-on: ubuntu-latest
+    outputs:
+      flood_threshold: ${{ steps.meta.outputs.flood_threshold }}
+      dem_source:      ${{ steps.meta.outputs.dem_source }}
+      skip_download:   ${{ steps.meta.outputs.skip_download }}
+      skip_downscale:  ${{ steps.meta.outputs.skip_downscale }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs & write summary
+        id: meta
+        env:
+          FLOOD_THRESHOLD: ${{ github.event.inputs.flood_threshold || '0.10' }}
+          DEM_SOURCE:      ${{ github.event.inputs.dem_source || 'usgs_3dep' }}
+          SKIP_DOWNLOAD:   ${{ github.event.inputs.skip_download || 'false' }}
+          SKIP_DOWNSCALE:  ${{ github.event.inputs.skip_downscale || 'false' }}
+        run: |
+          python - <<'EOF'
+          import os
+          import sys; sys.path.insert(0, ".")
+          from config.settings import KNOWN_EVENTS
+          t = float(os.environ["FLOOD_THRESHOLD"])
+          assert 0.0 <= t <= 1.0, f"flood_threshold must be 0-1, got {t}"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"flood_threshold={t}\n")
+              f.write(f"dem_source={os.environ['DEM_SOURCE']}\n")
+              f.write(f"skip_download={os.environ['SKIP_DOWNLOAD']}\n")
+              f.write(f"skip_downscale={os.environ['SKIP_DOWNSCALE']}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("## FloodPin Harvey Pipeline\n")
+              ev = KNOWN_EVENTS["H001"]
+              f.write(f"**Event:** H001 — Harvey ({ev['start_date']} → {ev['end_date']})\n")
+              f.write(f"**VIIRS tiles:** auto-discovered by AOI bbox (spatial overlap)\n")
+              f.write(f"**H3 resolution:** 8 (~461m)\n")
+              f.write(f"**DEM source:** {os.environ['DEM_SOURCE']}\n")
+              f.write(f"**Flood threshold:** {t}\n\n")
+          EOF
+
+  # ── 2. Fetch DEM ─────────────────────────────────────────────────────────────
+  # Stored in cache only (10 GB limit, not 0.5 GB artifact limit)
+  fetch-dem:
+    name: "2 — Fetch DEM"
+    needs: activate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip             # ← GitHub caches pip deps automatically
+      - run: pip install rasterio numpy requests pandas
+      - name: Restore DEM cache
+        id: dem_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/dem
+          key: ${{ env.CACHE_DEM }}-${{ needs.activate.outputs.dem_source }}
+      - name: Download DEM (if cache miss)
+        if: steps.dem_cache.outputs.cache-hit != 'true'
+        env:
+          DEM_SOURCE:       ${{ needs.activate.outputs.dem_source }}
+          OPENTOPO_API_KEY: ${{ secrets.OPENTOPO_API_KEY }}
+        run: |
+          python scripts/dem_fetch.py \
+            --aoi HARVEY \
+            --output-dir ${{ env.OUT }}/dem \
+            --source "$DEM_SOURCE" \
+            --api-key "$OPENTOPO_API_KEY"
+
+  # ── 3. Fetch permanent water mask ────────────────────────────────────────────
+  # Stored in cache only
+  fetch-perm-water:
+    name: "3 — Fetch permanent water mask"
+    needs: activate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install rasterio numpy requests pandas
+      - name: Restore perm-water cache
+        id: pw_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/perm_water
+          key: ${{ env.CACHE_PW }}
+      - name: Download water mask (if cache miss)
+        if: steps.pw_cache.outputs.cache-hit != 'true'
+        id: pw
+        continue-on-error: true
+        run: |
+          python scripts/perm_water.py \
+            --aoi HARVEY \
+            --output-dir ${{ env.OUT }}/perm_water \
+            --threshold 75
+      - name: Note if perm water unavailable
+        if: steps.pw.outcome == 'failure' || steps.pw.outcome == 'skipped'
+        run: |
+          echo "::warning::Permanent water mask unavailable — pipeline continues without it"
+          mkdir -p ${{ env.OUT }}/perm_water
+
+  # ── 4. Download VIIRS ────────────────────────────────────────────────────────
+  # Stored in cache only
+  download-viirs:
+    name: "4 — Download VIIRS"
+    needs: activate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install boto3 botocore rasterio numpy pandas
+      - name: Restore VIIRS cache
+        id: viirs_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/viirs
+          key: ${{ env.CACHE_VIIRS }}
+      - name: Download VIIRS (if cache miss or skip_download=false)
+        if: steps.viirs_cache.outputs.cache-hit != 'true' && needs.activate.outputs.skip_download != 'true'
+        run: |
+          python - <<'EOF'
+          import sys, datetime, itertools
+          from pathlib import Path
+          sys.path.insert(0, ".")
+          from scripts.viirs_download import download_viirs_for_event
+          from scripts.utils import load_aoi
+          bbox   = load_aoi("HARVEY")["bbox"]
+          aug_days = [datetime.date(2017, 8, d) for d in range(25, 32)]
+          sep_days = [datetime.date(2017, 9, d) for d in range(1, 2)]
+          dates    = aug_days + sep_days
+          result = download_viirs_for_event(dates, Path("./harvey_output/viirs"), bbox)
+          print(f"Mosaics ready: {sorted(result.keys())}")
+          if not result:
+              import sys; sys.exit(1)
+          EOF
+      - name: List mosaics
+        run: ls ${{ env.OUT }}/viirs/*.tif 2>/dev/null || echo "No mosaics"
+
+      - name: Upload VIIRS mosaics as artifact (download locally from Actions UI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: viirs-mosaics-harvey
+          path: ${{ env.OUT }}/viirs/*_VIIRS_mosaic.tif
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Save VIIRS debug stats to repo
+        run: |
+          python - <<'PYEOF'
+          import glob, json, sys
+          from pathlib import Path
+          sys.path.insert(0, ".")
+          import numpy as np
+          try:
+              import rasterio
+          except ImportError:
+              print("rasterio not available for stats"); sys.exit(0)
+          stats = []
+          for f in sorted(glob.glob("./harvey_output/viirs/*_VIIRS_mosaic.tif")):
+              date_str = Path(f).stem.split("_")[0]
+              with rasterio.open(f) as src:
+                  data = src.read(1).astype(float)
+                  valid = data[~np.isnan(data)]
+                  flood = valid[(valid > 0) & (valid <= 1)]
+                  stats.append({
+                      "date": date_str,
+                      "total_pixels": int(data.size),
+                      "valid_pixels": int(len(valid)),
+                      "flood_pixels": int(len(flood)),
+                      "mean_flood_fraction": round(float(flood.mean()), 4) if len(flood) else 0,
+                      "max_flood_fraction":  round(float(flood.max()),  4) if len(flood) else 0,
+                      "crs": str(src.crs),
+                      "resolution_deg": round(abs(src.transform[0]), 6),
+                      "bounds": list(src.bounds),
+                  })
+          Path("debug").mkdir(exist_ok=True)
+          Path("debug/viirs_stats.json").write_text(json.dumps(stats, indent=2))
+          print(json.dumps(stats, indent=2))
+          PYEOF
+
+  # ── 5. Downscale ─────────────────────────────────────────────────────────────
+  # Stored in cache only
+  downscale:
+    name: "5 — Downscale VIIRS to depth"
+    needs: [activate, fetch-dem, download-viirs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install rasterio numpy scipy pandas
+      - name: Restore DEM cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/dem
+          key: ${{ env.CACHE_DEM }}-${{ needs.activate.outputs.dem_source }}
+      - name: Restore VIIRS cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/viirs
+          key: ${{ env.CACHE_VIIRS }}
+      - name: Restore perm-water cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/perm_water
+          key: ${{ env.CACHE_PW }}
+      - name: Restore downscaled cache
+        id: ds_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/downscaled
+          key: ${{ env.CACHE_DS }}
+      - name: Run downscaling (if cache miss)
+        if: steps.ds_cache.outputs.cache-hit != 'true' && needs.activate.outputs.skip_downscale != 'true'
+        run: |
+          python - <<'EOF'
+          import sys, glob
+          from pathlib import Path
+          sys.path.insert(0, ".")
+          from scripts.downscale import run_downscaling
+          dem_path = next(iter(Path("./harvey_output/dem").glob("*.tif")), None)
+          pw_path  = Path("./harvey_output/perm_water/permanent_water_binary.tif")
+          ds_dir   = Path("./harvey_output/downscaled")
+          ds_dir.mkdir(parents=True, exist_ok=True)
+          if not dem_path:
+              print("No DEM found — skipping downscaling (depth will be null)")
+          else:
+              for mosaic in sorted(glob.glob("./harvey_output/viirs/*_VIIRS_mosaic.tif")):
+                  date_str = Path(mosaic).stem.split("_")[0]
+                  ext, dep = run_downscaling(
+                      Path(mosaic), str(dem_path),
+                      str(pw_path) if pw_path.exists() else None,
+                      ds_dir, date_str,
+                  )
+                  print(f"  [{date_str}] {'OK' if ext else 'skipped'}")
+          EOF
+
+  # ── 6. Zonal statistics ──────────────────────────────────────────────────────
+  # Stored in cache only
+  zonal-stats:
+    name: "6 — H3 zonal statistics"
+    needs: [activate, download-viirs, downscale, fetch-perm-water]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install rasterio "h3>=4.0" numpy pandas shapely
+      - name: Restore VIIRS cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/viirs
+          key: ${{ env.CACHE_VIIRS }}
+      - name: Restore downscaled cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/downscaled
+          key: ${{ env.CACHE_DS }}
+      - name: Restore perm-water cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/perm_water
+          key: ${{ env.CACHE_PW }}
+      - name: Restore zonal-stats cache
+        id: zs_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/zonal
+          key: ${{ env.CACHE_ZS }}
+      - name: Debug — list restored files
+        run: |
+          echo "VIIRS:"      && ls ${{ env.OUT }}/viirs/*.tif 2>/dev/null || echo "  none"
+          echo "Downscaled:" && ls ${{ env.OUT }}/downscaled/*.tif 2>/dev/null || echo "  none"
+          echo "Perm water:" && ls ${{ env.OUT }}/perm_water/*.tif 2>/dev/null || echo "  none"
+      - name: Run zonal statistics (if cache miss)
+        if: steps.zs_cache.outputs.cache-hit != 'true'
+        run: |
+          python - <<'EOF'
+          import sys, glob, traceback
+          from pathlib import Path
+          sys.path.insert(0, ".")
+          try:
+              from config.settings import H3_RESOLUTION
+              from scripts.h3_grid  import generate_h3_cells, cells_over_raster
+              from scripts.zonal_stats import run_zonal_stats
+          except Exception as e:
+              print(f"IMPORT ERROR: {e}"); traceback.print_exc(); sys.exit(1)
+
+          bbox      = [-98.0, 27.5, -93.0, 31.5]
+          all_cells = generate_h3_cells(bbox, resolution=H3_RESOLUTION)
+          pw_path   = Path("./harvey_output/perm_water/permanent_water_binary.tif")
+          zonal_dir = Path("./harvey_output/zonal")
+          zonal_dir.mkdir(parents=True, exist_ok=True)
+
+          mosaics = sorted(glob.glob("./harvey_output/viirs/*_VIIRS_mosaic.tif"))
+          print(f"VIIRS mosaics found: {len(mosaics)}")
+          for m in mosaics: print(f"  {m}")
+          if not mosaics:
+              print("ERROR: No VIIRS mosaics — VIIRS cache may be stale, bump CACHE_VIIRS key")
+              sys.exit(1)
+
+          # Diagnose first mosaic — CRS and bounds are critical
+          import rasterio
+          with rasterio.open(mosaics[0]) as src:
+              print(f"\nVIIRS raster diagnostics:")
+              print(f"  CRS:       {src.crs}")
+              print(f"  Bounds:    {src.bounds}")
+              print(f"  Transform: {src.transform}")
+              print(f"  Shape:     {src.width}x{src.height}")
+              print(f"  Nodata:    {src.nodata}")
+              data = src.read(1)
+              import numpy as np
+              valid = data[~np.isnan(data.astype(float))]
+              print(f"  Value range: {data.min()} to {data.max()}")
+              print(f"  Non-nan pixels: {np.sum(~np.isnan(data.astype(float)))}")
+          print(f"\nH3 grid bbox: [-98.0, 27.5, -93.0, 31.5]")
+          print(f"H3 cells: {len(all_cells)}")
+
+          total = 0
+          for mosaic in mosaics:
+              date_str   = Path(mosaic).stem.split("_")[0]
+              depth_path = Path(f"./harvey_output/downscaled/{date_str}_water_depth.tif")
+              try:
+                  cells = cells_over_raster(Path(mosaic), all_cells)
+                  df    = run_zonal_stats(
+                      viirs_path = Path(mosaic),
+                      depth_path = depth_path if depth_path.exists() else None,
+                      pw_path    = pw_path    if pw_path.exists()    else None,
+                      cells      = cells,
+                  )
+                  if not df.empty:
+                      df.to_csv(zonal_dir / f"{date_str}_zonal_stats.csv", index=False)
+                      total += len(df)
+                      print(f"  [{date_str}] {len(df)} cells")
+                  else:
+                      print(f"  [{date_str}] WARNING: empty result")
+              except Exception as e:
+                  print(f"  [{date_str}] ERROR: {e}"); traceback.print_exc()
+          print(f"Total cells with data: {total}")
+          if total == 0:
+              print("ERROR: No zonal stats produced"); sys.exit(1)
+          EOF
+
+  # ── 7. Generate pins ─────────────────────────────────────────────────────────
+  # Only artifact in the whole pipeline = final deliverable
+  generate-pins:
+    name: "7 — Generate FloodPin records"
+    needs: [activate, zonal-stats]
+    runs-on: ubuntu-latest
+    outputs:
+      total_pins:      ${{ steps.pins.outputs.total_pins }}
+      mean_confidence: ${{ steps.pins.outputs.mean_confidence }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install rasterio "h3>=4.0" numpy pandas shapely
+      - name: Restore zonal-stats cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/zonal
+          key: ${{ env.CACHE_ZS }}
+      - name: Build and validate pins
+        id: pins
+        env:
+          FLOOD_THRESHOLD: ${{ needs.activate.outputs.flood_threshold }}
+        run: |
+          python - <<'EOF'
+          import sys, os, glob, json
+          from pathlib import Path
+          sys.path.insert(0, ".")
+          import pandas as pd
+          from config.settings import KNOWN_EVENTS
+          from scripts.pin_schema import (
+              pins_from_zonal_stats, validate_pins,
+              save_csv, save_jsonl, save_geojson, to_dataframe,
+          )
+          EVENT    = KNOWN_EVENTS["H001"]
+          EVENT_ID = "H001"
+          threshold = float(os.environ.get("FLOOD_THRESHOLD", "0.10"))
+          all_pins  = []
+          pins_dir  = Path("./harvey_output/pins")
+          out_dir   = Path("./harvey_output")
+          pins_dir.mkdir(parents=True, exist_ok=True)
+
+          files = sorted(glob.glob("./harvey_output/zonal/*_zonal_stats.csv"))
+          print(f"Zonal stats files: {len(files)}")
+          for f in files:
+              date_str = Path(f).stem.split("_")[0]
+              df       = pd.read_csv(f)
+              pins     = pins_from_zonal_stats(df, EVENT_ID, date_str,
+                             EVENT["valid_start"], EVENT["valid_end"],
+                             flood_threshold=threshold)
+              valid, _ = validate_pins(pins)
+              all_pins.extend(valid)
+              if valid:
+                  save_csv(valid, pins_dir / f"{EVENT_ID}_{date_str}_pins.csv")
+
+          save_csv(all_pins,     out_dir / f"{EVENT_ID}_Harvey_all_pins.csv")
+          save_jsonl(all_pins,   out_dir / f"{EVENT_ID}_Harvey_all_pins.jsonl")
+          save_geojson(all_pins, out_dir / f"{EVENT_ID}_Harvey_all_pins.geojson")
+
+          n      = len(all_pins)
+          df     = to_dataframe(all_pins)
+          mean_c = round(float(df["confidence_overall"].mean()), 4) if n else 0.0
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"total_pins={n}\n")
+              f.write(f"mean_confidence={mean_c}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"\n## Pin Generation\n")
+              f.write(f"**Total pins:** {n} | **Mean confidence:** {mean_c:.3f}\n\n")
+              if n:
+                  f.write("| Metric | P10 | Mean | P90 |\n|--------|-----|------|-----|\n")
+                  f.write(f"| Flood probability | "
+                          f"{df['hazard_probability_p10'].mean():.3f} | "
+                          f"{df['hazard_probability_pct'].mean():.3f} | "
+                          f"{df['hazard_probability_p90'].mean():.3f} |\n")
+          print(f"Total pins: {n}  mean_confidence: {mean_c}")
+          EOF
+
+      # ← Only artifact in the pipeline: the final deliverable
+      - name: Upload pins (final deliverable — 30 day retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: floodpin-harvey-pins
+          path: |
+            ${{ env.OUT }}/pins/
+            ${{ env.OUT }}/H001_Harvey_all_pins.csv
+            ${{ env.OUT }}/H001_Harvey_all_pins.jsonl
+            ${{ env.OUT }}/H001_Harvey_all_pins.geojson
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ── 8. Validate confidence ───────────────────────────────────────────────────
+  validate:
+    name: "8 — Validate confidence"
+    needs: [generate-pins]
+    runs-on: ubuntu-latest
+    outputs:
+      confidence_acceptable: ${{ steps.check.outputs.confidence_acceptable }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assess confidence
+        id: check
+        env:
+          MEAN_CONFIDENCE:      ${{ needs.generate-pins.outputs.mean_confidence }}
+          TOTAL_PINS:           ${{ needs.generate-pins.outputs.total_pins }}
+          CONFIDENCE_THRESHOLD: "0.75"
+        run: |
+          python - <<'EOF'
+          import os
+          mean_c    = float(os.environ.get("MEAN_CONFIDENCE", "0"))
+          threshold = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.75"))
+          n_pins    = int(os.environ.get("TOTAL_PINS", "0"))
+          ok        = mean_c >= threshold and n_pins > 0
+          status    = "ACCEPTABLE" if ok else "UNACCEPTABLE"
+          emoji     = "✅" if ok else "❌"
+          print(f"Confidence {mean_c:.4f} vs threshold {threshold} → {status}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"confidence_acceptable={'true' if ok else 'false'}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"\n## Validation {emoji}\n")
+              f.write(f"| Metric | Value |\n|--------|-------|\n")
+              f.write(f"| Total pins | {n_pins} |\n")
+              f.write(f"| Mean confidence | {mean_c:.4f} |\n")
+              f.write(f"| Threshold | {threshold} |\n")
+              f.write(f"| Status | **{status}** |\n")
+          EOF
+      - name: Fail if unacceptable
+        if: steps.check.outputs.confidence_acceptable == 'false'
+        run: |
+          echo "::error::Confidence UNACCEPTABLE — see human-review job"
+          exit 1
+
+  # ── 9. Notify client ─────────────────────────────────────────────────────────
+  notify-client:
+    name: "9 — Notify client"
+    needs: [generate-pins, validate]
+    if: needs.validate.outputs.confidence_acceptable == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install pandas requests
+      - uses: actions/download-artifact@v4
+        with:
+          name: floodpin-harvey-pins
+          path: ${{ env.OUT }}
+      - name: Send email
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          CLIENT_EMAIL:     ${{ secrets.CLIENT_EMAIL }}
+          TOTAL_PINS:       ${{ needs.generate-pins.outputs.total_pins }}
+          MEAN_CONFIDENCE:  ${{ needs.generate-pins.outputs.mean_confidence }}
+        run: |
+          python scripts/send_email.py \
+            --to            "$CLIENT_EMAIL" \
+            --event-id      "H001" \
+            --hazard        flood \
+            --sources       "VIIRS" \
+            --issued-utc    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --confidence    "$MEAN_CONFIDENCE" \
+            --pins          "$TOTAL_PINS" \
+            --attachments   "${{ env.OUT }}"
+
+  # ── 10. Human review ─────────────────────────────────────────────────────────
+  human-review:
+    name: "10 — Human review"
+    needs: [generate-pins, validate]
+    if: always() && needs.validate.outputs.confidence_acceptable == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open GitHub Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `[FloodPin] Human review — H001 Harvey (conf=${{ needs.generate-pins.outputs.mean_confidence }})`,
+              body: [
+                `## Confidence below threshold`,
+                `| | |`,
+                `|---|---|`,
+                `| Event | H001 Harvey |`,
+                `| Total pins | ${{ needs.generate-pins.outputs.total_pins }} |`,
+                `| Mean confidence | ${{ needs.generate-pins.outputs.mean_confidence }} |`,
+                `| Threshold | 0.75 |`,
+                ``,
+                `**Action:** Check VIIRS cloud cover, verify DEM alignment, re-trigger.`,
+                ``,
+                `[View run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              ].join('\n'),
+              labels: ['needs-review', 'floodpin', 'low-confidence'],
+            });
+
+  # ── 11. Save debug outputs to repo ──────────────────────────────────────────
+  # Commits lightweight summaries to debug/ folder so you can inspect each step
+  save-debug:
+    name: "11 — Save debug outputs to repo"
+    needs: [generate-pins, zonal-stats]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - run: pip install rasterio "h3>=4.0" numpy pandas shapely
+
+      - name: Restore VIIRS cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/viirs
+          key: ${{ env.CACHE_VIIRS }}
+
+      - name: Restore zonal-stats cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/zonal
+          key: ${{ env.CACHE_ZS }}
+
+      - name: Restore DEM cache
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OUT }}/dem
+          key: ${{ env.CACHE_DEM }}-${{ needs.activate.outputs.dem_source }}
+
+      - name: Generate debug summaries
+        env:
+          TOTAL_PINS:      ${{ needs.generate-pins.outputs.total_pins }}
+          MEAN_CONFIDENCE: ${{ needs.generate-pins.outputs.mean_confidence }}
+          RUN_ID:          ${{ github.run_id }}
+          RUN_NUMBER:      ${{ github.run_number }}
+        run: |
+          python - <<'PYEOF'
+          import glob, json, os, sys
+          from pathlib import Path
+          from datetime import datetime
+          sys.path.insert(0, ".")
+          import numpy as np
+
+          debug = Path("debug")
+          debug.mkdir(exist_ok=True)
+          run_id  = os.environ.get("RUN_ID", "unknown")
+          run_num = os.environ.get("RUN_NUMBER", "?")
+          ts      = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          # ── 1. VIIRS mosaic stats ──────────────────────────────────────────
+          viirs_stats = []
+          try:
+              import rasterio
+              for f in sorted(glob.glob("./harvey_output/viirs/*_VIIRS_mosaic.tif")):
+                  date_str = Path(f).stem.split("_")[0]
+                  with rasterio.open(f) as src:
+                      data  = src.read(1).astype(np.float32)
+                      valid = data[~np.isnan(data)]
+                      flood = valid[(valid > 0) & (valid <= 1)]
+                  viirs_stats.append({
+                      "date":               date_str,
+                      "total_pixels":       int(data.size),
+                      "valid_pixels":       int(len(valid)),
+                      "flood_pixels":       int(len(flood)),
+                      "valid_pct":          round(len(valid)/max(data.size,1)*100, 1),
+                      "mean_flood_frac":    round(float(flood.mean()), 4) if len(flood) else 0,
+                      "p10_flood_frac":     round(float(np.percentile(flood,10)), 4) if len(flood) else 0,
+                      "p90_flood_frac":     round(float(np.percentile(flood,90)), 4) if len(flood) else 0,
+                      "max_flood_frac":     round(float(flood.max()), 4) if len(flood) else 0,
+                  })
+              print(f"VIIRS stats: {len(viirs_stats)} mosaics")
+          except Exception as e:
+              print(f"VIIRS stats error: {e}")
+          (debug/"viirs_stats.json").write_text(json.dumps(viirs_stats, indent=2))
+
+          # ── 2. DEM stats ───────────────────────────────────────────────────
+          dem_stats = {}
+          try:
+              import rasterio
+              dems = list(Path("./harvey_output/dem").glob("*.tif"))
+              if dems:
+                  with rasterio.open(dems[0]) as src:
+                      data = src.read(1).astype(np.float32)
+                      nd   = src.nodata if src.nodata else -9999
+                      valid = data[data != nd]
+                  dem_stats = {
+                      "file":          dems[0].name,
+                      "crs":           str(src.crs),
+                      "resolution_deg": round(abs(src.transform[0]), 6),
+                      "width":         src.width,
+                      "height":        src.height,
+                      "nodata_pct":    round((data==nd).sum()/data.size*100, 1),
+                      "elev_min_m":    round(float(valid.min()), 1) if len(valid) else None,
+                      "elev_max_m":    round(float(valid.max()), 1) if len(valid) else None,
+                      "elev_mean_m":   round(float(valid.mean()), 1) if len(valid) else None,
+                  }
+                  print(f"DEM stats: {dem_stats['elev_min_m']}m to {dem_stats['elev_max_m']}m")
+          except Exception as e:
+              print(f"DEM stats error: {e}")
+          (debug/"dem_stats.json").write_text(json.dumps(dem_stats, indent=2))
+
+          # ── 3. Zonal stats CSVs ────────────────────────────────────────────
+          import pandas as pd
+          zonal_summary = []
+          zonal_out = debug / "zonal"
+          zonal_out.mkdir(exist_ok=True)
+          for f in sorted(glob.glob("./harvey_output/zonal/*_zonal_stats.csv")):
+              date_str = Path(f).stem.split("_")[0]
+              df = pd.read_csv(f)
+              # Save full CSV to debug/zonal/
+              import shutil
+              shutil.copy(f, zonal_out / Path(f).name)
+              zonal_summary.append({
+                  "date":             date_str,
+                  "n_cells":          len(df),
+                  "mean_flood_prob":  round(float(df["hazard_probability_pct"].mean()), 4),
+                  "p10_flood_prob":   round(float(df["hazard_probability_p10"].mean()), 4),
+                  "p90_flood_prob":   round(float(df["hazard_probability_p90"].mean()), 4),
+                  "mean_confidence":  round(float(df["confidence_overall"].mean()), 4),
+                  "qa_pass_pct":      round(float(df["qa_flag"].astype(bool).mean())*100, 1),
+                  "coverage_flags":   df["coverage_flag"].value_counts().to_dict(),
+                  "depth_bins":       df["depth_bin_m"].value_counts().to_dict() if "depth_bin_m" in df else {},
+              })
+              print(f"  [{date_str}] {len(df)} cells  mean_flood={zonal_summary[-1]['mean_flood_prob']:.3f}")
+          (debug/"zonal_summary.json").write_text(json.dumps(zonal_summary, indent=2))
+
+          # ── 4. Run manifest ────────────────────────────────────────────────
+          manifest = {
+              "run_id":         run_id,
+              "run_number":     run_num,
+              "timestamp_utc":  ts,
+              "total_pins":     int(os.environ.get("TOTAL_PINS", "") or 0),
+              "mean_confidence": float(os.environ.get("MEAN_CONFIDENCE", "") or 0),
+              "viirs_dates":    [s["date"] for s in viirs_stats],
+              "viirs_ok":       len(viirs_stats) > 0,
+              "dem_ok":         bool(dem_stats),
+              "zonal_dates":    [s["date"] for s in zonal_summary],
+          }
+          (debug/"run_manifest.json").write_text(json.dumps(manifest, indent=2))
+          print(f"Run manifest: {json.dumps(manifest, indent=2)}")
+          PYEOF
+
+      - name: Commit debug outputs to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add debug/
+          git diff --staged --quiet && echo "No changes to commit" || (
+            git commit -m "debug: run #${{ github.run_number }} $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          )
