@@ -1,0 +1,11 @@
+{
+  "file": "dem_clipped.tif",
+  "crs": "EPSG:4269",
+  "resolution_deg": 0.000278,
+  "width": 18042,
+  "height": 14472,
+  "nodata_pct": 17.6,
+  "elev_min_m": -11.4,
+  "elev_max_m": 401.8,
+  "elev_mean_m": 59.9
+}
