@@ -62,7 +62,7 @@ from scipy import ndimage
 from shapely.geometry import Polygon
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config.settings import KNOWN_EVENTS, get_event_dates
+from config.settings import ACTIVE_EVENT_ID, KNOWN_EVENTS, get_event_dates
 from scripts.perm_water import get_permanent_water_mask as _jrc_perm_water
 from scripts.viirs_download import find_tiles_by_bbox, mosaic_and_normalise as _mosaic_normalise
 from scripts.notify import (
@@ -98,7 +98,7 @@ log = logging.getLogger("pipeline")
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-EVENT_ID        = "H001"
+EVENT_ID        = ACTIVE_EVENT_ID
 EVENT_NAME      = "Harvey"
 HAZARD_TYPE     = "flood"
 PRODUCT         = "FloodSENS"
@@ -321,6 +321,8 @@ def download_viirs_harvey(
                     except Exception: pass
         else:
             log.warning("[%s] No tiles found overlapping AOI", date_str)
+
+    return daily_mosaics
 
 
 # ─────────────────────────────────────────────────────────────────────────────
