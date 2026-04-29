@@ -70,6 +70,11 @@ COPERNICUS_LC100_TEMPLATE = (
 # VIIRS tiles are discovered spatially at runtime (find_tiles_by_bbox in viirs_download.py).
 # Hardcoded GLB numbers are not used — the NOAA JPSS VFM tile numbering does not
 # follow the expected SSEC geographic grid.
+# ── Active event ─────────────────────────────────────────────────────────────
+# Change this one line to switch between events defined in KNOWN_EVENTS below.
+ACTIVE_EVENT_ID = "H001"
+
+
 def get_event_dates(event_id: str) -> list:
     """Return a list of datetime.date objects for every day in the event's date range."""
     ev = KNOWN_EVENTS[event_id]
