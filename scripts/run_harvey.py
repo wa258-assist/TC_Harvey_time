@@ -17,7 +17,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.settings import FLOOD_THRESHOLD_PCT, H3_RESOLUTION, KNOWN_EVENTS, get_event_dates
+from config.settings import ACTIVE_EVENT_ID, FLOOD_THRESHOLD_PCT, H3_RESOLUTION, KNOWN_EVENTS, get_event_dates
 from scripts.utils    import get_logger, set_gha_output, utcnow_iso, load_aoi
 from scripts.dem_fetch    import fetch_dem
 from scripts.perm_water   import get_permanent_water_mask
@@ -37,7 +37,7 @@ from scripts.notify import (
 
 log = get_logger("run_harvey")
 
-EVENT_ID = "H001"
+EVENT_ID = ACTIVE_EVENT_ID
 EVENT    = KNOWN_EVENTS[EVENT_ID]
 DATES    = get_event_dates(EVENT_ID)
 
