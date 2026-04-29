@@ -1,0 +1,42 @@
+[
+  {
+    "date": "20170828",
+    "n_cells": 15,
+    "mean_flood_prob": 0.5447,
+    "p10_flood_prob": 0.5244,
+    "p90_flood_prob": 0.564,
+    "mean_confidence": 0.3928,
+    "qa_pass_pct": 66.7,
+    "coverage_flags": {
+      "good": 10,
+      "cloud": 5
+    },
+    "depth_bins": {
+      "0.0-0.1m": 6,
+      "0.1-0.3m": 3,
+      "0.6-1.0m": 1,
+      "0.3-0.6m": 1
+    }
+  },
+  {
+    "date": "20170829",
+    "n_cells": 1644,
+    "mean_flood_prob": 0.6683,
+    "p10_flood_prob": 0.6296,
+    "p90_flood_prob": 0.7063,
+    "mean_confidence": 0.4612,
+    "qa_pass_pct": 73.5,
+    "coverage_flags": {
+      "good": 1208,
+      "cloud": 436
+    },
+    "depth_bins": {
+      ">2.0m": 232,
+      "0.1-0.3m": 221,
+      "0.3-0.6m": 203,
+      "1.0-2.0m": 184,
+      "0.6-1.0m": 143,
+      "0.0-0.1m": 132
+    }
+  }
+]
