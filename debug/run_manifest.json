@@ -1,9 +1,9 @@
 {
-  "run_id": "25093994075",
-  "run_number": "6",
-  "timestamp_utc": "2026-04-29T06:23:30Z",
-  "total_pins": 1659,
-  "mean_confidence": 0.4606,
+  "run_id": "25115694479",
+  "run_number": "1",
+  "timestamp_utc": "2026-04-29T15:27:35Z",
+  "total_pins": 39839,
+  "mean_confidence": 0.6054,
   "viirs_dates": [
     "20170825",
     "20170826",
@@ -17,6 +17,9 @@
   "dem_ok": true,
   "zonal_dates": [
     "20170828",
-    "20170829"
+    "20170829",
+    "20170830",
+    "20170831",
+    "20170901"
   ]
 }

@@ -38,5 +38,68 @@
       "0.6-1.0m": 143,
       "0.0-0.1m": 132
     }
+  },
+  {
+    "date": "20170830",
+    "n_cells": 7568,
+    "mean_flood_prob": 0.6638,
+    "p10_flood_prob": 0.605,
+    "p90_flood_prob": 0.7204,
+    "mean_confidence": 0.5769,
+    "qa_pass_pct": 82.1,
+    "coverage_flags": {
+      "good": 6216,
+      "cloud": 1352
+    },
+    "depth_bins": {
+      "0.1-0.3m": 1179,
+      "0.3-0.6m": 975,
+      ">2.0m": 745,
+      "0.0-0.1m": 724,
+      "1.0-2.0m": 722,
+      "0.6-1.0m": 670
+    }
+  },
+  {
+    "date": "20170831",
+    "n_cells": 17175,
+    "mean_flood_prob": 0.6294,
+    "p10_flood_prob": 0.5753,
+    "p90_flood_prob": 0.6821,
+    "mean_confidence": 0.6288,
+    "qa_pass_pct": 83.9,
+    "coverage_flags": {
+      "good": 14418,
+      "cloud": 2757
+    },
+    "depth_bins": {
+      "0.3-0.6m": 2598,
+      "0.1-0.3m": 2582,
+      "1.0-2.0m": 1703,
+      "0.6-1.0m": 1670,
+      "0.0-0.1m": 1475,
+      ">2.0m": 1333
+    }
+  },
+  {
+    "date": "20170901",
+    "n_cells": 13437,
+    "mean_flood_prob": 0.6503,
+    "p10_flood_prob": 0.6012,
+    "p90_flood_prob": 0.6982,
+    "mean_confidence": 0.6094,
+    "qa_pass_pct": 82.4,
+    "coverage_flags": {
+      "good": 11070,
+      "cloud": 2367
+    },
+    "depth_bins": {
+      "0.1-0.3m": 2203,
+      "0.3-0.6m": 2089,
+      "0.0-0.1m": 1271,
+      "0.6-1.0m": 1270,
+      ">2.0m": 870,
+      "1.0-2.0m": 814
+    }
   }
 ]
